@@ -1,0 +1,6 @@
+venv/
+service_account.json
+leads.db
+agent_run.log
+__pycache__/
+*.pyc

@@ -1,0 +1,41 @@
+# Automatically tests that the install scripts actually run cleanly on
+# real Windows and real Mac machines, for free, every time this repo
+# changes. This does NOT click anything or verify the double-click
+# experience — it just proves the commands themselves succeed, so
+# obvious bugs get caught before a real person ever tries this.
+
+name: Test setup scripts
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:  # lets you also trigger it manually from GitHub's UI
+
+jobs:
+  test-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Mac setup script
+        run: |
+          chmod +x setup-mac.sh
+          ./setup-mac.sh
+      - name: Confirm the agent actually starts
+        run: |
+          ./venv/bin/python3 main.py &
+          sleep 3
+          curl -f http://127.0.0.1:8765/ping
+
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Windows setup script
+        run: .\setup-windows.bat
+        shell: cmd
+      - name: Confirm the agent actually starts
+        shell: powershell
+        run: |
+          Start-Process -NoNewWindow venv\Scripts\python.exe -ArgumentList "main.py"
+          Start-Sleep -Seconds 3
+          Invoke-WebRequest http://127.0.0.1:8765/ping -UseBasicParsing

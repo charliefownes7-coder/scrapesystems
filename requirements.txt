@@ -1,0 +1,9 @@
+streamlit
+pandas
+gspread
+playwright
+requests
+beautifulsoup4
+fastapi
+uvicorn
+pydantic
