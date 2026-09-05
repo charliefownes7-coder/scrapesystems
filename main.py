@@ -26,12 +26,31 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from db_store import DB_PATH, REQUIRED_COLUMNS, load_leads, save_leads
+from db_store import DB_PATH, REQUIRED_COLUMNS, load_leads, save_leads, _ensure_schema
 from scraper import scrape_maps, check_facebook_pages
 from swipe_launcher import router as swipe_launcher_router
 from agent import get_cities_in_region
 
 app = FastAPI(title="ScrapeSystems Local Agent")
+
+
+@app.on_event("startup")
+def _init_database():
+    """
+    Makes sure leads.db has the leads table (and every expected column)
+    before any request comes in. Without this, a brand-new install with
+    no leads.db yet — i.e. every first-time user, before their first
+    scrape ever saves anything — gets a 500 error the moment the
+    dashboard tries to load the (empty) leads list, since the table
+    itself doesn't exist until db_store.py's own load_leads()/save_leads()
+    happen to run it first.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        _ensure_schema(conn)
+        conn.commit()
+    finally:
+        conn.close()
 
 TOKEN_FILE = Path.home() / ".scrapesystems" / "token.json"
 
