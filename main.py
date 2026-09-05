@@ -17,6 +17,7 @@ import sqlite3
 import subprocess
 import threading
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -31,11 +32,9 @@ from scraper import scrape_maps, check_facebook_pages
 from swipe_launcher import router as swipe_launcher_router
 from agent import get_cities_in_region
 
-app = FastAPI(title="ScrapeSystems Local Agent")
 
-
-@app.on_event("startup")
-def _init_database():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     """
     Makes sure leads.db has the leads table (and every expected column)
     before any request comes in. Without this, a brand-new install with
@@ -51,6 +50,10 @@ def _init_database():
         conn.commit()
     finally:
         conn.close()
+    yield
+
+
+app = FastAPI(title="ScrapeSystems Local Agent", lifespan=lifespan)
 
 TOKEN_FILE = Path.home() / ".scrapesystems" / "token.json"
 
