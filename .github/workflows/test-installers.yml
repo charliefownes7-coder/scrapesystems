@@ -1,0 +1,205 @@
+name: Test ScrapeSystems installers
+
+# Runs the actual Mac and Windows launcher scripts on real GitHub-hosted
+# runners: real venv creation, real pip installs, real Playwright browser
+# downloads, real agent startup. Confirms both first-run (full setup) and
+# second-run (setup skipped) behavior on each platform.
+#
+# What this DOES catch: dependency/compile failures (e.g. the greenlet
+# architecture bug), Python version incompatibilities, the agent failing
+# to start or respond to /ping, setup not being skipped on a second run.
+#
+# What this does NOT catch: macOS Gatekeeper's "unidentified developer"
+# warning (only triggers on files downloaded through a real browser,
+# which tag the file with a quarantine attribute git checkout doesn't),
+# the actual double-click-in-Finder/Explorer experience, or anything
+# specific to older/unsupported OS versions than the runner uses.
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  test-mac:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Make launcher executable
+        run: chmod +x "Start ScrapeSystems.command"
+
+      - name: First run — full setup + launch
+        run: |
+          set -e
+          # Run in the background since it never exits on its own (it
+          # launches the agent, which runs until killed).
+          ./"Start ScrapeSystems.command" > first_run.log 2>&1 &
+          echo $! > agent.pid
+
+          echo "Waiting for the agent to respond on /ping..."
+          for i in $(seq 1 40); do
+            if curl -sf http://127.0.0.1:8765/ping > /dev/null; then
+              echo "Agent is up after ${i}0s"
+              break
+            fi
+            sleep 10
+          done
+
+          if ! curl -sf http://127.0.0.1:8765/ping > /dev/null; then
+            echo "❌ Agent never responded to /ping. Full log:"
+            cat first_run.log
+            exit 1
+          fi
+
+          if [ ! -f .setup_complete ]; then
+            echo "❌ .setup_complete marker was never created — second-run skip won't work."
+            exit 1
+          fi
+
+          echo "✅ First run: setup completed and agent is responding."
+
+      - name: Stop agent from first run
+        if: always()
+        run: kill "$(cat agent.pid)" 2>/dev/null || true
+
+      - name: Second run — should skip setup
+        run: |
+          set -e
+          ./"Start ScrapeSystems.command" > second_run.log 2>&1 &
+          echo $! > agent2.pid
+
+          for i in $(seq 1 20); do
+            if curl -sf http://127.0.0.1:8765/ping > /dev/null; then
+              break
+            fi
+            sleep 5
+          done
+
+          if ! curl -sf http://127.0.0.1:8765/ping > /dev/null; then
+            echo "❌ Agent never responded to /ping on second run. Full log:"
+            cat second_run.log
+            exit 1
+          fi
+
+          if grep -q "first-time setup" second_run.log; then
+            echo "❌ Second run re-ran setup instead of skipping it. Full log:"
+            cat second_run.log
+            exit 1
+          fi
+
+          echo "✅ Second run: setup was correctly skipped."
+
+      - name: Stop agent from second run
+        if: always()
+        run: kill "$(cat agent2.pid)" 2>/dev/null || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-run-logs
+          path: |
+            first_run.log
+            second_run.log
+
+  test-windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: First run — full setup + launch
+        shell: pwsh
+        run: |
+          $proc = Start-Process -FilePath ".\Start ScrapeSystems.bat" `
+            -RedirectStandardOutput first_run.log `
+            -RedirectStandardError first_run_err.log `
+            -PassThru
+          $proc.Id | Out-File agent.pid
+
+          $up = $false
+          for ($i = 0; $i -lt 40; $i++) {
+            try {
+              Invoke-WebRequest -Uri http://127.0.0.1:8765/ping -UseBasicParsing -TimeoutSec 5 | Out-Null
+              $up = $true
+              Write-Host "Agent is up after $($i * 10)s"
+              break
+            } catch {
+              Start-Sleep -Seconds 10
+            }
+          }
+
+          if (-not $up) {
+            Write-Host "Agent never responded to /ping. Full log:"
+            Get-Content first_run.log, first_run_err.log
+            exit 1
+          }
+
+          if (-not (Test-Path .setup_complete)) {
+            Write-Host "The .setup_complete marker was never created — second-run skip won't work."
+            exit 1
+          }
+
+          Write-Host "First run: setup completed and agent is responding."
+
+      - name: Stop agent from first run
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path agent.pid) {
+            Stop-Process -Id (Get-Content agent.pid) -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Second run — should skip setup
+        shell: pwsh
+        run: |
+          $proc = Start-Process -FilePath ".\Start ScrapeSystems.bat" `
+            -RedirectStandardOutput second_run.log `
+            -RedirectStandardError second_run_err.log `
+            -PassThru
+          $proc.Id | Out-File agent2.pid
+
+          $up = $false
+          for ($i = 0; $i -lt 20; $i++) {
+            try {
+              Invoke-WebRequest -Uri http://127.0.0.1:8765/ping -UseBasicParsing -TimeoutSec 5 | Out-Null
+              $up = $true
+              break
+            } catch {
+              Start-Sleep -Seconds 5
+            }
+          }
+
+          if (-not $up) {
+            Write-Host "Agent never responded to /ping on second run. Full log:"
+            Get-Content second_run.log, second_run_err.log
+            exit 1
+          }
+
+          if (Select-String -Path second_run.log -Pattern "first-time setup" -Quiet) {
+            Write-Host "Second run re-ran setup instead of skipping it. Full log:"
+            Get-Content second_run.log
+            exit 1
+          }
+
+          Write-Host "Second run: setup was correctly skipped."
+
+      - name: Stop agent from second run
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path agent2.pid) {
+            Stop-Process -Id (Get-Content agent2.pid) -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-run-logs
+          path: |
+            first_run.log
+            first_run_err.log
+            second_run.log
+            second_run_err.log
