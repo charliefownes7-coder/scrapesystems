@@ -37,13 +37,16 @@ if not exist venv (
 )
 
 echo Installing dependencies ^(this is the slow part, please wait^)...
-venv\Scripts\pip install --upgrade pip -q
+REM pip can't safely upgrade itself when invoked directly as pip.exe on
+REM Windows -- it can't replace its own running executable file. Running
+REM it via python.exe -m pip instead avoids that entirely.
+venv\Scripts\python.exe -m pip install --upgrade pip -q
 if %errorlevel% neq 0 (
     echo Something went wrong installing pip. Check your internet connection and try again.
     pause
     exit /b 1
 )
-venv\Scripts\pip install -r requirements.txt -q
+venv\Scripts\python.exe -m pip install -r requirements.txt -q
 if %errorlevel% neq 0 (
     echo Something went wrong installing dependencies. Check your internet connection and try again.
     pause
@@ -51,7 +54,7 @@ if %errorlevel% neq 0 (
 )
 
 echo Installing browser components for scraping...
-venv\Scripts\playwright install firefox chromium
+venv\Scripts\python.exe -m playwright install firefox chromium
 if %errorlevel% neq 0 (
     echo Something went wrong installing browser components. Try again, or check your internet connection.
     pause
