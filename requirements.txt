@@ -1,6 +1,4 @@
-streamlit
 pandas
-gspread
 playwright
 requests
 beautifulsoup4
