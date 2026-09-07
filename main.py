@@ -16,12 +16,14 @@ import queue
 import sqlite3
 import subprocess
 import threading
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Dict, Optional
 
 import pandas as pd
+import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
@@ -106,6 +108,114 @@ def load_token():
         return None
 
 
+# ---------------------------------------------------------------------------
+# Plans & usage
+# ---------------------------------------------------------------------------
+# IMPORTANT: replace with your real Supabase project values (Project
+# Settings -> API). The anon key is safe to ship in the app — it's the
+# same public key the website already uses, and Row Level Security on
+# the user_plans table (see supabase-schema.sql) is what actually keeps
+# one user from reading or changing another user's plan/usage.
+SUPABASE_URL = "https://inxymjalyniafhkbvggq.supabase.co"
+SUPABASE_ANON_KEY = "sb_publishable_EBN5BldgVsK_mf7hDMZnnA_bAGpUT6j"
+
+# Keep these two maps in sync with the same values used on the website
+# (pricing page, upgrade prompts) and in supabase-schema.sql's plan
+# check constraint — there's no single shared source of truth across
+# Python/SQL/the frontend, so a pricing change means updating all three.
+PLAN_CAPS = {"free": 250, "pro": 2500, "premium": 10000}
+PLAN_FEATURES = {
+    "free": {"facebook_check": False, "region_scrape": False},
+    "pro": {"facebook_check": True, "region_scrape": True},
+    "premium": {"facebook_check": True, "region_scrape": True},
+}
+
+# Short-lived cache so a fast-moving scrape (checking cap on every
+# single lead) doesn't hit Supabase once per lead just to read plan
+# status — only report_lead_saved()'s write happens that often.
+# Refreshed at the start of every job regardless, so a plan change
+# mid-scrape is picked up at the very next job even if this hasn't
+# expired yet.
+_plan_cache = {"status": None, "fetched_at": 0.0}
+PLAN_CACHE_SECONDS = 30
+
+
+def get_plan_status(force_refresh: bool = False) -> dict:
+    """
+    Fetches the logged-in user's plan + this period's usage from
+    Supabase, reusing the same JWT /auth-callback already saved — no
+    separate login needed for this. Falls back to the last known-good
+    value on a transient network error, and to the most restrictive
+    (free-tier) numbers if there's truly nothing to go on yet, so a
+    Supabase hiccup can never let a scrape run past someone's real cap,
+    and never crashes an in-progress job either.
+    """
+    default = {"plan": "free", "leads_used_this_period": 0, "cap": PLAN_CAPS["free"]}
+    saved = load_token()
+    if saved is None or not saved.get("token"):
+        return default
+
+    now = time.time()
+    if not force_refresh and _plan_cache["status"] and (now - _plan_cache["fetched_at"] < PLAN_CACHE_SECONDS):
+        return _plan_cache["status"]
+
+    try:
+        resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/user_plans",
+            params={"select": "plan,leads_used_this_period"},
+            headers={
+                "apikey": SUPABASE_ANON_KEY,
+                "Authorization": f"Bearer {saved['token']}",
+            },
+            timeout=8,
+        )
+        resp.raise_for_status()
+        rows = resp.json()
+        if not rows:
+            return default
+        plan = rows[0].get("plan", "free")
+        result = {
+            "plan": plan,
+            "leads_used_this_period": rows[0].get("leads_used_this_period", 0),
+            "cap": PLAN_CAPS.get(plan, PLAN_CAPS["free"]),
+        }
+        _plan_cache.update(status=result, fetched_at=now)
+        return result
+    except Exception as e:
+        print(f"  Warning: couldn't fetch plan status from Supabase ({e})")
+        return _plan_cache["status"] or default
+
+
+def report_lead_saved():
+    """
+    Tells Supabase one more lead was saved for the logged-in user, via
+    the increment_lead_usage() RPC (see supabase-schema.sql) — this is
+    what keeps the website's usage banner accurate in real time, since
+    it reads the same Supabase row. Best-effort: a failed call here
+    never breaks the scrape itself — worst case this one lead's usage
+    is undercounted until the next successful call catches back up, or
+    the next fresh get_plan_status() call reconciles it.
+    """
+    saved = load_token()
+    if saved is None or not saved.get("token"):
+        return
+    try:
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/rpc/increment_lead_usage",
+            json={"p_count": 1},
+            headers={
+                "apikey": SUPABASE_ANON_KEY,
+                "Authorization": f"Bearer {saved['token']}",
+                "Content-Type": "application/json",
+            },
+            timeout=8,
+        )
+        if _plan_cache["status"]:
+            _plan_cache["status"]["leads_used_this_period"] += 1
+    except Exception as e:
+        print(f"  Warning: couldn't report lead usage to Supabase ({e})")
+
+
 # IMPORTANT: replace with your real Lovable domain(s). Keep localhost
 # origins for local testing.
 ALLOWED_ORIGINS = [
@@ -183,6 +293,14 @@ class ScrapeRequest(BaseModel):
 
 def _run_job(job_id: str, niche: str, location: str, resume: Optional[dict] = None):
     stop_event = _stop_events[job_id]
+
+    # Checked once per job (not per lead — see get_plan_status()'s own
+    # cache) so a plan upgrade takes effect on the very next scrape,
+    # without needing the agent restarted.
+    plan_status = get_plan_status(force_refresh=True)
+    facebook_check_enabled = PLAN_FEATURES.get(
+        plan_status["plan"], PLAN_FEATURES["free"]
+    )["facebook_check"]
 
     # If this run is resuming a Maps-stage pause, we know roughly how
     # many cards had already loaded last time (cards_found_at_pause)
@@ -276,16 +394,87 @@ def _run_job(job_id: str, niche: str, location: str, resume: Optional[dict] = No
         return df[REQUIRED_COLUMNS]
 
     def on_lead_found(lead: dict):
-        # Saved the instant this one lead is ready, so it shows up in
-        # the website's leads table and count right away — not only
-        # after the whole scrape finishes.
-        save_leads(_lead_to_df(lead))
+        # "leads_found" always increments, capped or not — it's the
+        # progress bar's live counter, separate from what actually gets
+        # saved. Whoever is watching this scrape should see the real
+        # number of businesses found even in the leads past their cap.
         with _job_lock:
             if job_id in _jobs:
                 _jobs[job_id]["leads_found"] = _jobs[job_id].get("leads_found") or 0
                 _jobs[job_id]["leads_found"] += 1
 
+        usage = get_plan_status()
+        if usage["leads_used_this_period"] >= usage["cap"]:
+            # Over the plan's cap for this period. Deliberately doesn't
+            # stop the scrape/check itself — killing a live browser
+            # mid-stage is messier than it's worth — just stops this
+            # lead (and anything after it) from being written to
+            # leads.db or billed as usage. capped_leads_skipped lets the
+            # frontend tell the user how many were found but not saved.
+            with _job_lock:
+                if job_id in _jobs:
+                    _jobs[job_id]["cap_reached"] = True
+                    _jobs[job_id]["capped_leads_skipped"] = (
+                        _jobs[job_id].get("capped_leads_skipped", 0) + 1
+                    )
+            return
+
+        # Saved the instant this one lead is ready, so it shows up in
+        # the website's leads table and count right away — not only
+        # after the whole scrape finishes.
+        save_leads(_lead_to_df(lead))
+        report_lead_saved()
+
     try:
+        if not facebook_check_enabled:
+            # Free plan: Maps-only leads, full stop — no Facebook stage
+            # at all, not even to compute-and-discard it. This also
+            # means a free scrape never spends time on Firefox/Facebook
+            # lookups (the slowest, most block-prone part of a run) on
+            # a result the plan can't show anyway. No resumability here
+            # on purpose: turning a finished, in-memory businesses list
+            # into leads is fast and local, nothing worth checkpointing.
+            businesses = scrape_maps(
+                niche, location, on_scroll_progress=on_scroll_progress, should_stop=stop_event.is_set,
+            )
+            if stop_event.is_set():
+                with _job_lock:
+                    if job_id in _jobs:
+                        _jobs[job_id].pop("_resume", None)
+                        _end_requested.pop(job_id, None)
+                        found = _jobs[job_id].get("leads_found") or 0
+                        _jobs[job_id].update(
+                            phase="ended",
+                            message=f"Stopped — {found} lead(s) saved. This run won't be resumed.",
+                        )
+                return
+
+            for b in businesses:
+                on_lead_found({
+                    "Name": b["name"] or "",
+                    "Category": b["category"] or "",
+                    "Adress": b["address"] or "",
+                    "Phone": b["phone"] or "",
+                    "Rating": b["rating"] or "",
+                    "Reveiw count": b["review_count"] or "",
+                    "Has website": str(b["has_website"]),
+                    "Has facebook": "",
+                    "Facebook URL": "",
+                    "Maps URL": b["maps_url"] or "",
+                    "Search query": b["search_query"] or "",
+                })
+
+            with _job_lock:
+                if job_id in _jobs:
+                    _jobs[job_id].pop("_resume", None)
+                    _end_requested.pop(job_id, None)
+                    found = _jobs[job_id].get("leads_found") or 0
+                    _jobs[job_id].update(
+                        phase="done", current=100, total=100,
+                        message=f"Done — {found} lead(s) found (Facebook checking is a Pro feature).",
+                    )
+            return
+
         if resume and resume.get("stage") == "facebook":
             # Picking back up exactly where a previous stop left off -
             # skip the Maps stage entirely, re-check nothing already
@@ -701,6 +890,13 @@ def start_region_scrape(req: RegionScrapeRequest):
     if load_token() is None:
         raise HTTPException(status_code=401, detail="Not connected — log in on the website first.")
 
+    plan_status = get_plan_status(force_refresh=True)
+    if not PLAN_FEATURES.get(plan_status["plan"], PLAN_FEATURES["free"])["region_scrape"]:
+        raise HTTPException(
+            status_code=403,
+            detail="Region scrape is a Pro feature — upgrade to unlock it.",
+        )
+
     try:
         cities = get_cities_in_region(req.region)
     except Exception as e:
@@ -769,6 +965,11 @@ def get_leads():
             "moveToColdCall": bool(row["move_to_cold_call"]),
             "mapsUrl": row["maps_url"] or "",
             "searchQuery": row["search_query"] or "",
+            # ISO 8601 UTC timestamp set once, when the lead row is
+            # first inserted (see db_store.py's save_leads() INSERT).
+            # Used by the dashboard's leads-over-time chart to bucket
+            # leads by day/hour.
+            "createdAt": row["created_at"] if "created_at" in row.keys() else None,
             # "screened" is added by lead_review.py the first time a
             # swipe session runs (ALTER TABLE) — guard against it not
             # existing yet on a fresh install that hasn't used that
@@ -778,6 +979,81 @@ def get_leads():
         for row in rows
     ]
     return {"leads": leads}
+
+
+@app.post("/leads/{lead_id}/recheck-facebook")
+def recheck_facebook(lead_id: int):
+    """
+    Manually re-runs the Facebook-page lookup for ONE existing lead —
+    e.g. a lead saved back when this account was on Free (no Facebook
+    data at all), or one whose Facebook status just looks stale.
+    Deliberately exempt from this period's cap: refreshing a field on
+    a row that's already saved and already counted isn't new usage,
+    so this never calls report_lead_saved() either. Still gated on
+    plan, though — Free never gets Facebook data, recheck or not.
+
+    Runs the real Firefox-based lookup synchronously (typically ~10-20
+    seconds — browser launch plus one deliberate pacing delay, see
+    check_facebook_pages' docstring), so the frontend should show a
+    spinner rather than expect an instant response.
+    """
+    if load_token() is None:
+        raise HTTPException(status_code=401, detail="Not connected — log in on the website first.")
+
+    plan_status = get_plan_status(force_refresh=True)
+    if not PLAN_FEATURES.get(plan_status["plan"], PLAN_FEATURES["free"])["facebook_check"]:
+        raise HTTPException(
+            status_code=403,
+            detail="Facebook page checking is a Pro feature — upgrade to unlock it.",
+        )
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT business_name, niche, address, phone, rating, review_count, website, maps_url, search_query "
+        "FROM leads WHERE id = ?",
+        (lead_id,),
+    ).fetchone()
+    conn.close()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"No lead with id {lead_id}")
+
+    # Reshape back into the lowercase "business" dict check_facebook_pages
+    # expects (the same shape scrape_maps() produces) — the inverse of
+    # db_store.py's _row_to_sheet_dict mapping.
+    business = {
+        "name": row["business_name"] or "",
+        "category": row["niche"] or "",
+        "address": row["address"] or "",
+        "phone": row["phone"] or "",
+        "rating": row["rating"] or "",
+        "review_count": row["review_count"] or "",
+        "has_website": bool(row["website"]),
+        "maps_url": row["maps_url"] or "",
+        "search_query": row["search_query"] or "",
+    }
+
+    # A single business is enough context for find_facebook_page — its
+    # own address stands in for "location" here, since a one-off
+    # recheck doesn't carry the original search's location separately.
+    leads, _remaining = check_facebook_pages([business], business["address"])
+    if not leads:
+        raise HTTPException(status_code=500, detail="Facebook check didn't return a result — try again.")
+
+    updated = leads[0]
+    has_facebook = updated["Has facebook"] == "True"
+    facebook_url = updated["Facebook URL"]
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE leads SET has_facebook = ?, facebook_url = ?, updated_at = datetime('now') WHERE id = ?",
+        (int(has_facebook), facebook_url, lead_id),
+    )
+    conn.commit()
+    conn.close()
+
+    return {"id": lead_id, "hasFacebook": has_facebook, "facebookUrl": facebook_url}
 
 
 CALL_STATUS_OPTIONS = [

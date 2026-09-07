@@ -6,6 +6,7 @@ Run with: streamlit run app.py
 
 import hashlib
 import random
+import subprocess
 import time
 
 import pandas as pd
@@ -183,6 +184,16 @@ def _categorize(df):
     return df[~dm_mask], df[dm_mask]
 
 
+def _screened_as(df, value):
+    """Rows the swipe tool has marked Screened == value ('good' or
+    'bad'). Used by the Good Leads / Bad Leads tabs - separate from
+    _categorize, since those two tabs are specifically "what the swipe
+    tool decided", not the full Cold Call / DM Leads split."""
+    if "Screened" not in df.columns:
+        return df.iloc[0:0]
+    return df[df["Screened"].astype(str) == value]
+
+
 def _segment_stats(segment_df, exclude_from_contacted=None, exclude_entirely=None):
     """Total/Not Contacted/Contacted counts for a lead segment - always
     computed from the FULL segment (unaffected by the status filter
@@ -346,10 +357,13 @@ def _render_editor(df, key, status_label="Call status", status_options=None, col
     # Column display order: "Select" and "#" always lead (unchanged),
     # then any columns named in column_priority in that exact order,
     # then whatever's left over in its original sheet order. "Move to
-    # Cold Call" always stays hidden either way - it's set via the
-    # button below, not edited in-line.
+    # Cold Call" and "Screened" always stay hidden either way - "Move
+    # to Cold Call" is set via the button below, and "Screened" is an
+    # internal marker the swipe tool manages on its own; which tab
+    # you're looking at already tells you its value.
     fixed = ["Select", "#"]
-    remaining = [c for c in view.columns if c not in fixed and c != "Move to Cold Call"]
+    hidden = {"Move to Cold Call", "Screened"}
+    remaining = [c for c in view.columns if c not in fixed and c not in hidden]
     if column_priority:
         ordered_rest = [c for c in column_priority if c in remaining]
         ordered_rest += [c for c in remaining if c not in ordered_rest]
@@ -418,11 +432,21 @@ def _render_editor(df, key, status_label="Call status", status_options=None, col
     selected = edited[edited["Select"]]
     selected = selected[selected.index < len(original_index)]
 
-    to_save = edited.drop(columns=["#", "Select"], errors="ignore")
-    n = min(len(to_save), len(original_index))
-    to_save = to_save.iloc[:n].copy()
-    to_save.index = original_index[:n]
-    st.session_state.leads.update(to_save)
+    # NOTE: there used to be a block here that took the entire `edited`
+    # grid (every row currently in view, not just changed ones) and
+    # wrote it back into st.session_state.leads via .update() on every
+    # rerun. That was the root cause of the mass "Bad Lead" incident:
+    # st.data_editor returns the WHOLE grid, not just what was
+    # intentionally changed, so any accidental multi-row interaction
+    # (a drag-fill, paste, or select-all-ish gesture) landing in that
+    # returned dataframe got silently treated as thousands of
+    # deliberate edits and pushed straight through to the database.
+    # _on_commit (this editor's on_change callback, above) already
+    # applies edits correctly using Streamlit's own edited_rows diff -
+    # the actual list of cells that changed - so it alone is the
+    # source of truth for what gets written. Removed the redundant
+    # full-grid write entirely rather than trying to make it "safer",
+    # since it was never necessary in the first place.
 
     _, btn_col = st.columns([4, 1])
     with btn_col:
@@ -441,7 +465,9 @@ def _render_editor(df, key, status_label="Call status", status_options=None, col
             st.warning("Select at least one row first.")
 
 
-tab_all, tab_call, tab_dm = st.tabs(["All", "Cold Call Leads", "Facebook DM Leads"])
+tab_all, tab_call, tab_dm, tab_good, tab_bad = st.tabs(
+    ["All", "Cold Call Leads", "Facebook DM Leads", "Good Leads", "Bad Leads"]
+)
 
 with tab_all:
     metric_placeholder = st.empty()
@@ -542,6 +568,16 @@ with tab_dm:
         'posted recently, or are unlikely to respond. Mark a lead '
         '"Bad Lead" to flag it without moving it to Cold Call right away.'
     )
+
+    swipe_col, _ = st.columns([1, 3])
+    with swipe_col:
+        if st.button("🔥 Start Swipe Session", key="start_swipe", width="stretch"):
+            subprocess.Popen(["python3", "swipe_tool.py"])
+            st.toast(
+                "Swipe tool launching — a browser window will open. "
+                "Right = Good, Left = Bad, Esc = Quit."
+            )
+
     _render_editor(
         dm_view,
         key="editor_dm",
@@ -562,6 +598,51 @@ with tab_dm:
         dm1.metric("Total DM Leads", dm_total)
         dm2.metric("Not Contacted", dm_not_contacted)
         dm3.metric("DMs Sent", dm_sent)
+
+with tab_good:
+    st.caption(
+        "Leads the swipe tool marked GOOD — an active-looking Facebook "
+        "page, ready to DM."
+    )
+
+    all_good = _screened_as(st.session_state.leads, "good")
+    good_not_contacted = (all_good["Call status"] == "Not Contacted").sum() if len(all_good) else 0
+
+    only_not_contacted = st.checkbox(
+        f"Show only Not Contacted ({good_not_contacted})",
+        value=True,
+        key="good_only_not_contacted",
+        help="Uncheck to see every Good Lead, including ones already DMed.",
+    )
+    good_base = all_good[all_good["Call status"] == "Not Contacted"] if only_not_contacted else all_good
+
+    good_view = _apply_common_filters(good_base)
+    _render_editor(
+        good_view,
+        key="editor_good",
+        status_label="DM Status",
+        status_options=DM_STATUS_OPTIONS,
+        column_priority=["Name", "Category", "Facebook URL", "Call status"],
+    )
+    gg1, gg2 = st.columns(2)
+    gg1.metric("Total Good Leads", len(all_good))
+    gg2.metric("Not Contacted", good_not_contacted)
+
+with tab_bad:
+    st.caption(
+        "Leads the swipe tool marked BAD — Facebook page looked "
+        "inactive or abandoned. Stays visible in Facebook DM Leads too "
+        "(not auto-moved to Cold Call) so you can still see it there."
+    )
+    bad_view = _apply_common_filters(_screened_as(st.session_state.leads, "bad"))
+    _render_editor(
+        bad_view,
+        key="editor_bad",
+        status_label="Call status",
+        status_options=CALL_STATUS_OPTIONS,
+        column_priority=["Name", "Category", "Facebook URL", "Call status"],
+    )
+    st.metric("Total Bad Leads", len(_screened_as(st.session_state.leads, "bad")))
 
 # Compared as strings rather than with .equals() directly - .equals()
 # also checks column dtypes, not just values, and a dtype could
