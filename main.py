@@ -11,6 +11,7 @@ ScrapeSystems local agent — Phase 1 + 3 + 4
   reusing the exact same progress shape the Streamlit app already uses
 """
 
+import itertools
 import json
 import queue
 import sqlite3
@@ -19,17 +20,21 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
 
 import pandas as pd
 import requests
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from db_store import DB_PATH, REQUIRED_COLUMNS, load_leads, save_leads, _ensure_schema
+from db_store import (
+    DB_PATH, REQUIRED_COLUMNS, load_leads, save_leads, _ensure_schema,
+    log_scrape_history, get_scrape_history,
+)
 from scraper import scrape_maps, check_facebook_pages
 from swipe_launcher import router as swipe_launcher_router
 from agent import get_cities_in_region
@@ -123,7 +128,7 @@ SUPABASE_ANON_KEY = "sb_publishable_EBN5BldgVsK_mf7hDMZnnA_bAGpUT6j"
 # (pricing page, upgrade prompts) and in supabase-schema.sql's plan
 # check constraint — there's no single shared source of truth across
 # Python/SQL/the frontend, so a pricing change means updating all three.
-PLAN_CAPS = {"free": 250, "pro": 2500, "premium": 10000}
+PLAN_CAPS = {"free": 500, "pro": 5000, "premium": 50000}
 PLAN_FEATURES = {
     "free": {"facebook_check": False, "region_scrape": False},
     "pro": {"facebook_check": True, "region_scrape": True},
@@ -221,21 +226,79 @@ def report_lead_saved():
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "https://preview--leads-finder-dash.lovable.app",
-    # Add your published (non-preview) Lovable URL here once you
-    # publish the app — CORS silently blocks requests from any origin
-    # not in this list, which would make a real client's browser
-    # look like "agent not connected" even when it's running fine.
-    # Example: "https://leads-finder-dash.lovable.app"
+    "https://leads-finder-dash.lovable.app",
+    "https://scrape.systems",
+    "https://www.scrape.systems",
 ]
+
+# Any *.lovable.app or *.lovableproject.com preview/staging URL is also
+# allowed, so a new Lovable preview link never silently gets blocked
+# (which would look like "agent not connected" even though it's running
+# fine). Anything outside those two patterns must be added to
+# ALLOWED_ORIGINS above explicitly.
+ALLOWED_ORIGIN_REGEX = r"^https://([a-zA-Z0-9-]+\.)*(lovable\.app|lovableproject\.com)$"
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=ALLOWED_ORIGIN_REGEX,
     allow_methods=["GET", "POST", "PATCH", "DELETE"],
     allow_headers=["*"],
 )
 
 app.include_router(swipe_launcher_router)
+
+
+# ---------------------------------------------------------------------------
+# CSRF guard for state-changing endpoints
+# ---------------------------------------------------------------------------
+# The dashboard's shared agent client attaches this header to every
+# request. It is NOT a secret (it ships in the dashboard's public JS
+# bundle) — the real protection is that a custom header forces the
+# browser to preflight, and CORS above only lets that preflight
+# succeed for allow-listed origins. So this blocks a malicious website
+# from silently driving the agent via a victim's browser; it does not
+# (and can't) stop something on the same machine that already knows
+# the header value, same as any other localhost-only service.
+REQUIRED_CLIENT_HEADER_VALUE = "scrapesystems-web"
+
+
+def require_dashboard_client(x_scrapesystems_client: Optional[str] = Header(None)):
+    if x_scrapesystems_client != REQUIRED_CLIENT_HEADER_VALUE:
+        raise HTTPException(
+            status_code=403,
+            detail="Missing or invalid X-ScrapeSystems-Client header.",
+        )
+
+
+DEVICE_FILE = Path.home() / ".scrapesystems" / "device.json"
+
+
+def load_or_create_device_id() -> str:
+    """
+    Returns a stable per-machine ID, generating and persisting one on
+    first call. Backs the "one account per device" limit — the
+    frontend fetches this via GET /device-id and passes it to
+    Supabase's claim_device RPC after sign-in/sign-up.
+    """
+    try:
+        if DEVICE_FILE.exists():
+            data = json.loads(DEVICE_FILE.read_text())
+            existing = data.get("device_id")
+            if existing:
+                return existing
+    except (json.JSONDecodeError, OSError):
+        pass  # fall through and regenerate if the file is missing/corrupt
+
+    new_id = str(uuid.uuid4())
+    DEVICE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    DEVICE_FILE.write_text(json.dumps({"device_id": new_id}))
+    return new_id
+
+
+@app.get("/device-id")
+def device_id():
+    return {"status": "ok", "device_id": load_or_create_device_id()}
 
 
 @app.get("/ping")
@@ -251,8 +314,33 @@ def status():
     return {"status": "ok", "authenticated": True, "email": saved.get("email")}
 
 
+class AuthCallbackBody(BaseModel):
+    token: str
+    email: Optional[str] = None
+
+
+@app.post("/auth-callback")
+def auth_callback_post(
+    body: AuthCallbackBody,
+    _: None = Depends(require_dashboard_client),
+):
+    """
+    Same as the GET route below, but for current dashboard builds:
+    keeps the login token out of the URL (query strings can end up in
+    browser history, server logs, and the Referer header) by sending
+    it in the POST body instead, and requires the dashboard's client
+    header like every other state-changing endpoint.
+    """
+    save_token(body.token, body.email)
+    return {"status": "ok"}
+
+
 @app.get("/auth-callback", response_class=HTMLResponse)
 def auth_callback(token: str = Query(...), email: Optional[str] = Query(None)):
+    """
+    Legacy path, kept so older downloaded/packaged agents (built before
+    the POST route above existed) keep working without an update.
+    """
     save_token(token, email)
     display_email = email or "your account"
     return f"""
@@ -285,22 +373,105 @@ _stop_events: Dict[str, threading.Event] = {}
 # keep the checkpoint so /run-scrape/continue can pick it back up).
 _end_requested: Dict[str, bool] = {}
 
+# Tracks progress toward ONE combined Scrape History entry per region
+# run, keyed by region_run_id. Region scrapes queue one job per city
+# (see start_region_scrape below) and those jobs finish one at a time
+# through the same FIFO worker — this dict is how _log_scrape_completion
+# knows to wait until every city in the region has finished before
+# writing a single "Region scrape" row with the combined lead count,
+# instead of logging one row per city.
+_region_progress: Dict[str, dict] = {}
+
 
 class ScrapeRequest(BaseModel):
     niche: str
     location: str
 
 
+def _found_summary(found: int, duplicates: int) -> str:
+    """
+    Formats how many leads a finished (or stopped) scrape found:
+    "X new leads found, Y duplicates found" — always both numbers, to
+    avoid the earlier ambiguity where "X leads found, Y duplicates"
+    left it unclear whether X included the duplicates or not.
+
+    `found` is the TOTAL businesses found (duplicates are a subset of
+    it), so X here is found - duplicates, i.e. the actual new/unique
+    count, never overlapping with Y.
+    """
+    new_leads = found - duplicates
+    return f"{new_leads} new leads found, {duplicates} duplicates found"
+
+
+def _log_scrape_completion(job_id: str):
+    """
+    Writes one Scrape History row for a job that just finished
+    (phase == "done"). Called from inside _job_lock at every place in
+    _run_job (and the /run-scrape/end endpoint) where a job reaches a
+    terminal state, so job/_region_progress reads below are always
+    consistent.
+
+    Regular (including queued) scrapes: logged individually, one row
+    per job, as soon as that job finishes OR is hard-stopped (phase
+    "done" or "ended") — including a job stopped immediately after it
+    started, which logs with whatever it found (possibly 0).
+
+    Region scrapes: NOT logged individually. Each city job in a region
+    run shares a region_run_id (see start_region_scrape); this
+    accumulates leads_found across all of them and only writes the
+    single combined "Region scrape" row once every city job for that
+    region_run_id has reached "done" or "ended" — so a region run that
+    gets stopped partway still logs, with whatever cities had finished
+    or been stopped contributing their results. A "stopped" (paused,
+    resumable) city doesn't count yet, since it might still be resumed
+    and finish normally. A city that errors out is the one case still
+    not handled — that group simply never completes and never logs.
+    """
+    job = _jobs.get(job_id)
+    if job is None:
+        return
+
+    leads_found = job.get("leads_found") or 0
+    duplicates_found = job.get("duplicates_found") or 0
+    region_run_id = job.get("region_run_id")
+
+    if region_run_id:
+        progress = _region_progress.get(region_run_id)
+        if progress is None:
+            return
+        progress["completed"] += 1
+        progress["leads_found"] += leads_found
+        progress["duplicates_found"] += duplicates_found
+        if progress["completed"] >= progress["expected"]:
+            log_scrape_history(
+                search_query="Region scrape",
+                scrape_type="region",
+                leads_found=progress["leads_found"],
+                duplicates_found=progress["duplicates_found"],
+                sent_at=progress["sent_at"],
+                region_run_id=region_run_id,
+            )
+            _region_progress.pop(region_run_id, None)
+    else:
+        search_query = f"{job.get('niche', '')} in {job.get('location', '')}".strip()
+        log_scrape_history(
+            search_query=search_query,
+            scrape_type="regular",
+            leads_found=leads_found,
+            duplicates_found=duplicates_found,
+            sent_at=job.get("sent_at") or datetime.now(timezone.utc).isoformat(),
+        )
+
+
 def _run_job(job_id: str, niche: str, location: str, resume: Optional[dict] = None):
     stop_event = _stop_events[job_id]
 
-    # Checked once per job (not per lead — see get_plan_status()'s own
-    # cache) so a plan upgrade takes effect on the very next scrape,
-    # without needing the agent restarted.
-    plan_status = get_plan_status(force_refresh=True)
-    facebook_check_enabled = PLAN_FEATURES.get(
-        plan_status["plan"], PLAN_FEATURES["free"]
-    )["facebook_check"]
+    # NOTE: Facebook-page checking is NO LONGER gated by plan here.
+    # Every plan runs the full Maps -> Facebook pipeline below; the
+    # only Facebook-related feature still gated by plan is the
+    # dedicated Facebook Checker tool's on-demand recheck endpoint
+    # (see /leads/{id}/recheck-facebook further down), which still
+    # correctly reads PLAN_FEATURES["facebook_check"].
 
     # If this run is resuming a Maps-stage pause, we know roughly how
     # many cards had already loaded last time (cards_found_at_pause)
@@ -422,59 +593,16 @@ def _run_job(job_id: str, niche: str, location: str, resume: Optional[dict] = No
         # Saved the instant this one lead is ready, so it shows up in
         # the website's leads table and count right away — not only
         # after the whole scrape finishes.
-        save_leads(_lead_to_df(lead))
+        result = save_leads(_lead_to_df(lead))
+        if result.get("duplicates"):
+            with _job_lock:
+                if job_id in _jobs:
+                    _jobs[job_id]["duplicates_found"] = (
+                        _jobs[job_id].get("duplicates_found", 0) + result["duplicates"]
+                    )
         report_lead_saved()
 
     try:
-        if not facebook_check_enabled:
-            # Free plan: Maps-only leads, full stop — no Facebook stage
-            # at all, not even to compute-and-discard it. This also
-            # means a free scrape never spends time on Firefox/Facebook
-            # lookups (the slowest, most block-prone part of a run) on
-            # a result the plan can't show anyway. No resumability here
-            # on purpose: turning a finished, in-memory businesses list
-            # into leads is fast and local, nothing worth checkpointing.
-            businesses = scrape_maps(
-                niche, location, on_scroll_progress=on_scroll_progress, should_stop=stop_event.is_set,
-            )
-            if stop_event.is_set():
-                with _job_lock:
-                    if job_id in _jobs:
-                        _jobs[job_id].pop("_resume", None)
-                        _end_requested.pop(job_id, None)
-                        found = _jobs[job_id].get("leads_found") or 0
-                        _jobs[job_id].update(
-                            phase="ended",
-                            message=f"Stopped — {found} lead(s) saved. This run won't be resumed.",
-                        )
-                return
-
-            for b in businesses:
-                on_lead_found({
-                    "Name": b["name"] or "",
-                    "Category": b["category"] or "",
-                    "Adress": b["address"] or "",
-                    "Phone": b["phone"] or "",
-                    "Rating": b["rating"] or "",
-                    "Reveiw count": b["review_count"] or "",
-                    "Has website": str(b["has_website"]),
-                    "Has facebook": "",
-                    "Facebook URL": "",
-                    "Maps URL": b["maps_url"] or "",
-                    "Search query": b["search_query"] or "",
-                })
-
-            with _job_lock:
-                if job_id in _jobs:
-                    _jobs[job_id].pop("_resume", None)
-                    _end_requested.pop(job_id, None)
-                    found = _jobs[job_id].get("leads_found") or 0
-                    _jobs[job_id].update(
-                        phase="done", current=100, total=100,
-                        message=f"Done — {found} lead(s) found (Facebook checking is a Pro feature).",
-                    )
-            return
-
         if resume and resume.get("stage") == "facebook":
             # Picking back up exactly where a previous stop left off -
             # skip the Maps stage entirely, re-check nothing already
@@ -503,6 +631,7 @@ def _run_job(job_id: str, niche: str, location: str, resume: Optional[dict] = No
                                 phase="ended",
                                 message=f"Stopped — {found} lead(s) saved. This run won't be resumed.",
                             )
+                            _log_scrape_completion(job_id)
                         else:
                             # Snapshot exactly what the progress bar showed
                             # right before pausing (current/total/message) so
@@ -526,6 +655,41 @@ def _run_job(job_id: str, niche: str, location: str, resume: Optional[dict] = No
                                 "progress_snapshot": progress_snapshot,
                             }
                 return
+
+            # Trim to exactly what's left in this billing period before
+            # running the slow, block-prone Facebook-check stage. Without
+            # this, a scrape that finds e.g. 9 businesses with only 5
+            # leads of quota left would still burn a Firefox lookup on
+            # all 9, even though on_lead_found() below was always going
+            # to discard the last 4 anyway. This is purely an efficiency
+            # cut, NOT the actual cap enforcement - on_lead_found()'s own
+            # per-lead check right below is still what actually decides
+            # what gets saved/counted, and still applies even here (e.g.
+            # if another device's scrape used up quota in the meantime).
+            leads_room = get_plan_status(force_refresh=True)
+            quota_remaining = max(leads_room["cap"] - leads_room["leads_used_this_period"], 0)
+            if len(businesses) > quota_remaining:
+                trimmed_count = len(businesses) - quota_remaining
+                # These businesses are being skipped for the exact same
+                # reason on_lead_found() skips leads past the cap - they
+                # just never get that far since we're cutting them before
+                # the (expensive) Facebook check even runs. Record them
+                # the same way on_lead_found() would, so the "leads
+                # found" progress count and capped_leads_skipped (which
+                # the frontend's usage-limit popup watches) stay accurate
+                # even though these specific businesses never get
+                # Facebook-checked or saved.
+                with _job_lock:
+                    if job_id in _jobs:
+                        _jobs[job_id]["leads_found"] = (
+                            _jobs[job_id].get("leads_found") or 0
+                        ) + trimmed_count
+                        _jobs[job_id]["cap_reached"] = True
+                        _jobs[job_id]["capped_leads_skipped"] = (
+                            _jobs[job_id].get("capped_leads_skipped", 0) + trimmed_count
+                        )
+                businesses = businesses[:quota_remaining]
+
             leads, remaining = check_facebook_pages(
                 businesses, location,
                 on_progress=on_progress, on_lead_found=on_lead_found, should_stop=stop_event.is_set,
@@ -543,6 +707,7 @@ def _run_job(job_id: str, niche: str, location: str, resume: Optional[dict] = No
                             phase="ended",
                             message=f"Stopped — {found} lead(s) saved. This run won't be resumed.",
                         )
+                        _log_scrape_completion(job_id)
                     else:
                         _jobs[job_id].update(
                             phase="stopped",
@@ -558,31 +723,72 @@ def _run_job(job_id: str, niche: str, location: str, resume: Optional[dict] = No
                 else:
                     _jobs[job_id].pop("_resume", None)
                     _end_requested.pop(job_id, None)
+                    found = _jobs[job_id].get("leads_found") or len(leads)
+                    duplicates = _jobs[job_id].get("duplicates_found") or 0
                     _jobs[job_id].update(
                         phase="done", current=100, total=100,
-                        message=f"Done — {len(leads)} leads found",
+                        message=f"Done — {_found_summary(found, duplicates)}",
                     )
+                    _log_scrape_completion(job_id)
     except Exception as e:
         with _job_lock:
             if job_id in _jobs:
                 _jobs[job_id].update(phase="error", message=str(e))
 
 
-_scrape_queue: "queue.Queue[str]" = queue.Queue()
+_scrape_queue: "queue.PriorityQueue" = queue.PriorityQueue()
+_queue_seq = itertools.count()
 _worker_thread: Optional[threading.Thread] = None
 _worker_lock = threading.Lock()
+
+
+def _enqueue_job(job_id: str, priority: int = 10):
+    """
+    Adds job_id to the scrape queue. Lower priority number = runs
+    sooner. Regular newly-queued scrapes use the default priority
+    (10) and are ordered by insertion order among themselves via
+    the monotonic _queue_seq tie-breaker - same FIFO behavior as
+    before for normal queueing.
+
+    Resuming a paused ("stopped") scrape uses priority=0 so it
+    always jumps ahead of anything already sitting in the queue,
+    rather than going to the back of the line behind scrapes that
+    were queued while it was paused - Continue should mean "pick
+    back up now", not "wait your turn again".
+    """
+    _scrape_queue.put((priority, next(_queue_seq), job_id))
 
 
 def _scrape_worker():
     """
     The ONE thread that ever actually runs a scrape. Pulls job_ids off
-    _scrape_queue strictly in the order they were put there - queue.Queue
-    is genuinely FIFO, so unlike the old semaphore-race approach, there's
-    no thread-scheduling luck involved in deciding which job goes next.
-    Submission order == execution order, guaranteed.
+    _scrape_queue in priority order (see _enqueue_job) - normal queued
+    scrapes run in submission order, but a resumed/continued scrape
+    always jumps to the front of the line.
+
+    IMPORTANT: the "wait while something is paused" check happens
+    BEFORE pulling anything off the queue, not after. If a job is
+    dequeued first and then waits, it can end up holding e.g. the
+    2nd queued scrape while a paused 1st scrape sits re-queued with
+    higher priority - by the time the pause clears, this thread is
+    already committed to running the wrong job. Waiting up front
+    means nothing is ever dequeued until it's actually safe to run
+    whatever comes out next, so a resumed job's priority is honored.
     """
     while True:
-        job_id = _scrape_queue.get()
+        # Don't pull anything off the queue while another job is
+        # paused ("stopped") - just wait. This is what lets a
+        # Continue (which re-queues at priority=0) actually win the
+        # next queue.get() instead of losing to something that was
+        # dequeued earlier while frozen.
+        while True:
+            with _job_lock:
+                paused = any(j.get("phase") == "stopped" for j in _jobs.values())
+            if not paused:
+                break
+            time.sleep(0.5)
+
+        _priority, _seq, job_id = _scrape_queue.get()
         try:
             with _job_lock:
                 job = _jobs.get(job_id)
@@ -612,7 +818,7 @@ def _ensure_worker():
             _worker_thread.start()
 
 
-@app.post("/run-scrape")
+@app.post("/run-scrape", dependencies=[Depends(require_dashboard_client)])
 def start_scrape(req: ScrapeRequest):
     """
     Adds a new scrape job to the FIFO queue and returns immediately.
@@ -638,6 +844,20 @@ def start_scrape(req: ScrapeRequest):
     if load_token() is None:
         raise HTTPException(status_code=401, detail="Not connected — log in on the website first.")
 
+    # Already fully capped for this billing period - refuse outright
+    # rather than let a brand-new scrape run its full (possibly
+    # minutes-long) Maps stage only to discard every result once
+    # on_lead_found()/the quota trim above kick in. The frontend should
+    # catch this 402 and show the same usage-limit popup used when an
+    # in-progress scrape hits the cap, instead of silently queuing
+    # something that was never going to save anything.
+    usage = get_plan_status(force_refresh=True)
+    if usage["leads_used_this_period"] >= usage["cap"]:
+        raise HTTPException(
+            status_code=402,
+            detail=f"You've used all {usage['cap']} leads for this billing period. Upgrade to keep scraping.",
+        )
+
     ACTIVE_PHASES = ("queued", "starting", "scraping_maps", "checking_facebook")
 
     with _job_lock:
@@ -656,10 +876,15 @@ def start_scrape(req: ScrapeRequest):
             "phase": "queued", "current": 0, "total": 100,
             "message": "Queued — waiting for the current scrape to finish",
             "leads_found": 0,
+            # When this scrape was actually submitted — used by Scrape
+            # History (see _log_scrape_completion) instead of whenever
+            # it happens to finish, since queue wait + run time can
+            # push completion well past when the user actually sent it.
+            "sent_at": datetime.now(timezone.utc).isoformat(),
         }
 
     _ensure_worker()
-    _scrape_queue.put(job_id)
+    _enqueue_job(job_id)
     return {"job_id": job_id, "status": "started"}
 
 
@@ -726,7 +951,7 @@ def scrape_status(
         return _job_view(job)
 
 
-@app.post("/run-scrape/stop")
+@app.post("/run-scrape/stop", dependencies=[Depends(require_dashboard_client)])
 def stop_scrape(job_id: Optional[str] = Query(None)):
     """
     Requests a running scrape to stop as soon as it safely can —
@@ -749,7 +974,7 @@ def stop_scrape(job_id: Optional[str] = Query(None)):
     return {"status": "stopping", "job_id": job_id}
 
 
-@app.post("/run-scrape/continue")
+@app.post("/run-scrape/continue", dependencies=[Depends(require_dashboard_client)])
 def continue_scrape(job_id: Optional[str] = Query(None)):
     """
     Resumes a stopped scrape from its saved checkpoint. If it stopped
@@ -784,15 +1009,15 @@ def continue_scrape(job_id: Optional[str] = Query(None)):
         job.pop("_resume", None)
         job.update(
             phase="queued",
-            message="Queued to resume — waiting for the current scrape to finish",
+            message="Resuming — will start as soon as the current scrape finishes",
         )
 
     _ensure_worker()
-    _scrape_queue.put(job_id)
+    _enqueue_job(job_id, priority=0)
     return {"job_id": job_id, "status": "resumed"}
 
 
-@app.post("/run-scrape/end")
+@app.post("/run-scrape/end", dependencies=[Depends(require_dashboard_client)])
 def end_scrape(job_id: Optional[str] = Query(None)):
     """
     Hard-stops a job for good — unlike /run-scrape/stop (Pause), this
@@ -828,6 +1053,7 @@ def end_scrape(job_id: Optional[str] = Query(None)):
                 phase="ended",
                 message=f"Stopped — {found} lead(s) saved. This run won't be resumed.",
             )
+            _log_scrape_completion(job_id)
         else:
             _end_requested[job_id] = True
             _stop_events[job_id].set()
@@ -835,7 +1061,7 @@ def end_scrape(job_id: Optional[str] = Query(None)):
     return {"status": "stopping", "job_id": job_id}
 
 
-@app.delete("/jobs/{job_id}")
+@app.delete("/jobs/{job_id}", dependencies=[Depends(require_dashboard_client)])
 def delete_job(job_id: str):
     """
     Removes a finished job from memory entirely — called by the
@@ -876,7 +1102,7 @@ class RegionScrapeRequest(BaseModel):
     region: str
 
 
-@app.post("/run-region-scrape")
+@app.post("/run-region-scrape", dependencies=[Depends(require_dashboard_client)])
 def start_region_scrape(req: RegionScrapeRequest):
     """
     Looks up every city/town inside the given region (free OSM
@@ -909,6 +1135,13 @@ def start_region_scrape(req: RegionScrapeRequest):
     job_ids = []
 
     with _job_lock:
+        _region_progress[region_run_id] = {
+            "expected": len(cities),
+            "completed": 0,
+            "leads_found": 0,
+            "duplicates_found": 0,
+            "sent_at": datetime.now(timezone.utc).isoformat(),
+        }
         for city in cities:
             job_id = str(uuid.uuid4())
             _stop_events[job_id] = threading.Event()
@@ -922,12 +1155,109 @@ def start_region_scrape(req: RegionScrapeRequest):
 
     _ensure_worker()
     for job_id in job_ids:
-        _scrape_queue.put(job_id)
+        _enqueue_job(job_id)
 
     return {
         "region_run_id": region_run_id, "region": req.region,
         "cities_found": len(cities), "job_ids": job_ids,
     }
+
+
+@app.post("/run-region-scrape/cancel", dependencies=[Depends(require_dashboard_client)])
+def cancel_region_scrape(region_run_id: Optional[str] = Query(None)):
+    """
+    Cancels an entire region run in one call ("Stop All").
+
+    Queued cities are removed from memory outright (the worker skips
+    any job id it can no longer find), and the city actually running
+    is hard-stopped exactly like /run-scrape/end — its already-saved
+    leads stay saved, and it finalizes as "ended" a moment later.
+    Paused and already-finished cities are removed too, so a page
+    reload can never redraw the cancelled queue.
+
+    If region_run_id isn't given, every region job currently tracked
+    is cancelled.
+    """
+    cancelled, stopping = [], []
+    with _job_lock:
+        targets = [
+            jid for jid, j in list(_jobs.items())
+            if j.get("region_run_id")
+            and (region_run_id is None or j.get("region_run_id") == region_run_id)
+        ]
+        touched_runs = set()
+        for jid in targets:
+            job = _jobs.get(jid)
+            if job is None:
+                continue
+            touched_runs.add(job.get("region_run_id"))
+            phase = job.get("phase")
+            if phase not in ("queued", "stopped", "done", "error", "ended", "idle"):
+                # A live thread owns this one — flag it so it finalizes
+                # as "ended" (no resume checkpoint) at its next safe
+                # stopping point, keeping every lead already saved.
+                _end_requested[jid] = True
+                ev = _stop_events.get(jid)
+                if ev is not None:
+                    ev.set()
+                stopping.append(jid)
+            else:
+                # Queued, paused or finished: drop it entirely, but let
+                # a paused city's already-found leads still count toward
+                # the region's combined totals before it's removed.
+                progress = _region_progress.get(job.get("region_run_id"))
+                if progress is not None and phase == "stopped":
+                    progress["completed"] += 1
+                    progress["leads_found"] += job.get("leads_found") or 0
+                    progress["duplicates_found"] += job.get("duplicates_found") or 0
+                _jobs.pop(jid, None)
+                _stop_events.pop(jid, None)
+                _end_requested.pop(jid, None)
+                cancelled.append(jid)
+
+        # Re-baseline each touched region run to what actually ran (plus
+        # anything still finalizing), so the combined-row threshold in
+        # _log_scrape_completion can be reached even though the queued
+        # cities above were dropped instead of ever running.
+        for rid in touched_runs:
+            if not rid:
+                continue
+            progress = _region_progress.get(rid)
+            if progress is None:
+                continue
+            still_stopping = sum(
+                1 for jid in stopping
+                if (_jobs.get(jid) or {}).get("region_run_id") == rid
+            )
+            progress["expected"] = progress["completed"] + still_stopping
+            if still_stopping == 0:
+                # Nothing left to finish for this run — write the
+                # partial Scrape History row now.
+                if progress["completed"] > 0:
+                    log_scrape_history(
+                        search_query="Region scrape",
+                        scrape_type="region",
+                        leads_found=progress["leads_found"],
+                        duplicates_found=progress["duplicates_found"],
+                        sent_at=progress["sent_at"],
+                        region_run_id=rid,
+                    )
+                _region_progress.pop(rid, None)
+
+    return {"status": "cancelled", "removed": cancelled, "stopping": stopping}
+
+
+@app.get("/scrape-history")
+def scrape_history():
+    """
+    Returns past scrape runs for the Scrape History sidebar section,
+    most recent first. Flat, read-only, non-clickable list per the
+    agreed scope — nothing here links back to individual leads, and
+    nothing is backfilled for scrapes that ran before this shipped.
+    """
+    if load_token() is None:
+        raise HTTPException(status_code=401, detail="Not connected — log in on the website first.")
+    return {"history": get_scrape_history()}
 
 
 @app.get("/leads")
@@ -981,7 +1311,7 @@ def get_leads():
     return {"leads": leads}
 
 
-@app.post("/leads/{lead_id}/recheck-facebook")
+@app.post("/leads/{lead_id}/recheck-facebook", dependencies=[Depends(require_dashboard_client)])
 def recheck_facebook(lead_id: int):
     """
     Manually re-runs the Facebook-page lookup for ONE existing lead —
@@ -1082,7 +1412,7 @@ class StatusUpdate(BaseModel):
     status: str
 
 
-@app.patch("/leads/{lead_id}/status")
+@app.patch("/leads/{lead_id}/status", dependencies=[Depends(require_dashboard_client)])
 def update_lead_status(lead_id: int, body: StatusUpdate):
     """
     Updates a single lead's status by its real row id — the only
@@ -1106,6 +1436,35 @@ def update_lead_status(lead_id: int, body: StatusUpdate):
     return {"id": lead_id, "callStatus": body.status}
 
 
+class LeadFieldsUpdate(BaseModel):
+    call_notes: Optional[str] = None
+    text_phone_number: Optional[str] = None
+    email: Optional[str] = None
+@app.patch("/leads/{lead_id}", dependencies=[Depends(require_dashboard_client)])
+def update_lead_fields(lead_id: int, body: LeadFieldsUpdate):
+    if load_token() is None:
+        raise HTTPException(status_code=401, detail="Not connected — log in on the website first.")
+
+    updates = body.dict(exclude_unset=True)
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields provided to update.")
+
+    set_clause = ", ".join(f"{field} = ?" for field in updates)
+    values = list(updates.values())
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.execute(
+        f"UPDATE leads SET {set_clause}, updated_at = datetime('now') WHERE id = ?",
+        (*values, lead_id),
+    )
+    conn.commit()
+    updated = cur.rowcount
+    conn.close()
+
+    if updated == 0:
+        raise HTTPException(status_code=404, detail=f"No lead with id {lead_id}")
+
+    return {"id": lead_id, **updates}
 if __name__ == "__main__":
     import uvicorn
 

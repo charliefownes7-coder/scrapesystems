@@ -85,6 +85,31 @@ def _ensure_schema(conn):
             """
         )
 
+    if "scrape_history" not in tables:
+        conn.execute(
+            """
+            CREATE TABLE scrape_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                search_query TEXT NOT NULL,
+                scrape_type TEXT NOT NULL,
+                leads_found INTEGER NOT NULL DEFAULT 0,
+                duplicates_found INTEGER NOT NULL DEFAULT 0,
+                sent_at TEXT NOT NULL,
+                region_run_id TEXT
+            )
+            """
+        )
+    else:
+        # Migration for dbs created before duplicates_found existed —
+        # same pattern as the `leads` table's new_columns loop below.
+        # Existing history rows just get 0, since the real duplicate
+        # count for those past runs was never captured.
+        existing_history_cols = {row[1] for row in conn.execute("PRAGMA table_info(scrape_history)")}
+        if "duplicates_found" not in existing_history_cols:
+            conn.execute(
+                "ALTER TABLE scrape_history ADD COLUMN duplicates_found INTEGER NOT NULL DEFAULT 0"
+            )
+
     existing = {row[1] for row in conn.execute("PRAGMA table_info(leads)")}
     new_columns = {
         "call_notes": "TEXT",
@@ -148,6 +173,60 @@ def _ensure_schema(conn):
     _SCHEMA_ENSURED = True
 
 
+def log_scrape_history(
+    search_query: str,
+    scrape_type: str,
+    leads_found: int,
+    sent_at: str,
+    duplicates_found: int = 0,
+    region_run_id: str = None,
+) -> None:
+    """
+    Records one completed scrape run for the Scrape History sidebar
+    list. Called once per regular/queued scrape when it finishes, or
+    once per region scrape (already summed across every city in that
+    region — see main.py's region-scrape completion tracking, which is
+    what makes it "one entry" instead of one per city).
+
+    leads_found is the TOTAL businesses found (duplicates are a subset
+    of it), matching _found_summary's convention in main.py — the
+    sidebar computes "X new leads found, Y duplicates found" the same
+    way the live in-progress message does, rather than storing a
+    pre-subtracted "new leads" number.
+
+    sent_at is passed in rather than computed here (datetime.now())
+    because it should reflect when the scrape was actually SENT/queued
+    by the user, not when this row happens to get written — those can
+    differ by however long the scrape sat in the FIFO queue plus
+    however long it took to run.
+    """
+    with _conn() as conn:
+        _ensure_schema(conn)
+        conn.execute(
+            """
+            INSERT INTO scrape_history (search_query, scrape_type, leads_found, duplicates_found, sent_at, region_run_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (search_query, scrape_type, leads_found, duplicates_found, sent_at, region_run_id),
+        )
+
+
+def get_scrape_history(limit: int = 200) -> list:
+    """
+    Returns past scrape runs, most recent first, for the Scrape
+    History sidebar list. Read-only, non-clickable list per the
+    agreed scope — no filtering, no linking back to leads.
+    """
+    with _conn() as conn:
+        _ensure_schema(conn)
+        rows = conn.execute(
+            "SELECT search_query, scrape_type, leads_found, duplicates_found, sent_at "
+            "FROM scrape_history ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def _row_to_sheet_dict(row: sqlite3.Row) -> dict:
     return {
         "Name": row["business_name"] or "",
@@ -192,13 +271,18 @@ def load_leads() -> pd.DataFrame:
 MASS_STATUS_CHANGE_THRESHOLD = 20
 
 
-def save_leads(df: pd.DataFrame) -> None:
+def save_leads(df: pd.DataFrame) -> dict:
     """
     Upserts every row in df into leads.db, matched by (Name, Adress).
     Existing rows get their editable fields updated; a Name+Adress
     combo not already in the db gets inserted fresh. Rows already in
     the db but NOT present in df (e.g. added by the overnight agent
     after this session's df was loaded) are left completely alone.
+
+    Returns {"inserted": n, "duplicates": n} — n rows that were brand
+    new vs. n rows that matched an existing lead and became an update
+    instead. Existing callers that ignore the return value (there were
+    none expecting one before this) are unaffected.
 
     SAFETY GUARD (added after the mass "Bad Lead" incident): before
     writing anything, this does a read-only pass comparing each row's
@@ -290,6 +374,15 @@ def save_leads(df: pd.DataFrame) -> None:
         phone_cache: dict = {}
         name_cache: dict = {}
 
+        # A "duplicate" here means the row matched an EXISTING lead
+        # already in leads.db (by address, then phone, then name-only
+        # fallback — same matching order as pass 1 above) and became
+        # an UPDATE rather than a brand-new row. Counted so a scrape
+        # can report "62 leads found, 29 duplicates" instead of just a
+        # single found count — see _log_scrape_completion in main.py.
+        inserted_count = 0
+        duplicate_count = 0
+
         for name, address, phone_val, existing, row in planned:
             name_l = name.lower()
             if existing is None:
@@ -311,6 +404,7 @@ def save_leads(df: pd.DataFrame) -> None:
             move_to_cold_call = str(row.get("Move to Cold Call", "")).strip().lower() == "true"
 
             if existing:
+                duplicate_count += 1
                 conn.execute(
                     """
                     UPDATE leads SET
@@ -340,6 +434,7 @@ def save_leads(df: pd.DataFrame) -> None:
                     ),
                 )
             else:
+                inserted_count += 1
                 conn.execute(
                     """
                     INSERT INTO leads (
@@ -379,3 +474,5 @@ def save_leads(df: pd.DataFrame) -> None:
                     phone_cache[(name_l, phone_val.strip().lower())] = new_id
                 if not address and not phone_val:
                     name_cache[name_l] = new_id
+
+    return {"inserted": inserted_count, "duplicates": duplicate_count}

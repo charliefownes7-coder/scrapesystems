@@ -4,3 +4,5 @@ leads.db
 agent_run.log
 __pycache__/
 *.pyc
+*.zip
+.fuse_hidden*

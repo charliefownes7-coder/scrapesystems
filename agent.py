@@ -37,6 +37,7 @@ import argparse
 import re
 import sqlite3
 import sys
+import threading
 import time
 import traceback
 from contextlib import contextmanager
@@ -61,7 +62,47 @@ OVERPASS_URLS = [
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.openstreetmap.ru/api/interpreter",
 ]
-USER_AGENT = "ScrapeSystems-LeadGen/1.0 (contact: charlie@sterlingdigital.example)"
+USER_AGENT = "ScrapeSystems/1.0 (scrapesystems@gmail.com)"
+
+# --- Nominatim politeness -----------------------------------------------
+# Their usage policy allows at most 1 request/second per IP and requires an
+# identifying User-Agent. We enforce both here so no code path can violate it.
+NOMINATIM_MIN_INTERVAL = 1.0  # seconds between outgoing Nominatim requests
+NOMINATIM_MAX_ATTEMPTS = 3    # initial try + 2 retries
+NOMINATIM_BACKOFF = 2.0       # seconds, doubled each retry
+
+_nominatim_lock = threading.Lock()
+_nominatim_last_request = 0.0
+
+
+def _nominatim_get(params: dict):
+    """GET Nominatim with a global 1 req/sec throttle and retry/backoff."""
+    global _nominatim_last_request
+    last_error = None
+    for attempt in range(NOMINATIM_MAX_ATTEMPTS):
+        with _nominatim_lock:
+            wait = NOMINATIM_MIN_INTERVAL - (time.monotonic() - _nominatim_last_request)
+            if wait > 0:
+                time.sleep(wait)
+            _nominatim_last_request = time.monotonic()
+        try:
+            resp = requests.get(
+                NOMINATIM_URL,
+                params=params,
+                headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+                timeout=15,
+            )
+            # 429/503 are Nominatim's rate-limit / overload responses.
+            if resp.status_code in (429, 503) or resp.status_code >= 500:
+                last_error = f"Nominatim returned {resp.status_code}"
+            else:
+                resp.raise_for_status()
+                return resp
+        except requests.RequestException as e:
+            last_error = f"Nominatim request failed: {e}"
+        if attempt < NOMINATIM_MAX_ATTEMPTS - 1:
+            time.sleep(NOMINATIM_BACKOFF * (2 ** attempt))
+    raise RuntimeError(last_error or "Nominatim request failed")
 
 
 # ---------------------------------------------------------------------------
@@ -307,13 +348,9 @@ class LeadsDB:
 # ---------------------------------------------------------------------------
 
 def get_area_id(region_name: str) -> dict:
-    resp = requests.get(
-        NOMINATIM_URL,
-        params={"q": region_name, "format": "json", "limit": 1, "polygon_geojson": 0},
-        headers={"User-Agent": USER_AGENT},
-        timeout=15,
+    resp = _nominatim_get(
+        {"q": region_name, "format": "json", "limit": 1, "polygon_geojson": 0}
     )
-    resp.raise_for_status()
     results = resp.json()
     if not results:
         raise ValueError(f"Could not find region: {region_name!r}")
