@@ -121,6 +121,15 @@ def _ensure_schema(conn):
         "search_query": "TEXT",
         "move_to_cold_call": "INTEGER DEFAULT 0",
         "screened": "TEXT",
+        # ISO 8601 UTC timestamp, set the first time a lead's status
+        # moves away from the default "Not Contacted" (see
+        # _next_contacted_at below), and cleared if it's ever set back
+        # to "Not Contacted"/blank. NULL means "never contacted" (or a
+        # lead saved before this column existed - old leads are
+        # deliberately NOT backfilled with invented dates). Replaces an
+        # earlier browser-localStorage approach, which couldn't survive
+        # a different browser/device or cleared site data.
+        "contacted_at": "TEXT",
     }
     for col, coltype in new_columns.items():
         if col not in existing:
@@ -171,6 +180,25 @@ def _ensure_schema(conn):
 
     conn.commit()
     _SCHEMA_ENSURED = True
+
+
+def _next_contacted_at(current_contacted_at, new_status, now_iso):
+    """
+    Decides what a lead's contacted_at should become when its status
+    is set to new_status.
+
+    - Blank or "Not Contacted" (case-insensitive) -> None (clears it).
+    - Anything else -> keeps the EXISTING contacted_at if one is set,
+      otherwise stamps now_iso. Re-editing the status later never
+      moves the date forward.
+
+    Not applied retroactively to leads that existed before this column
+    did: a made-up date would misrepresent history.
+    """
+    normalized = (new_status or "").strip().lower()
+    if normalized in ("", "not contacted"):
+        return None
+    return current_contacted_at or now_iso
 
 
 def log_scrape_history(
@@ -318,18 +346,18 @@ def save_leads(df: pd.DataFrame) -> dict:
             existing = None
             if address:
                 existing = conn.execute(
-                    "SELECT id, status FROM leads WHERE business_name = ? COLLATE NOCASE AND address = ? COLLATE NOCASE",
+                    "SELECT id, status, contacted_at FROM leads WHERE business_name = ? COLLATE NOCASE AND address = ? COLLATE NOCASE",
                     (name, address),
                 ).fetchone()
             phone_val = str(row.get("Phone", "")).strip()
             if not existing and phone_val:
                 existing = conn.execute(
-                    "SELECT id, status FROM leads WHERE business_name = ? COLLATE NOCASE AND phone = ? COLLATE NOCASE",
+                    "SELECT id, status, contacted_at FROM leads WHERE business_name = ? COLLATE NOCASE AND phone = ? COLLATE NOCASE",
                     (name, phone_val),
                 ).fetchone()
             if not existing and not address and not phone_val:
                 existing = conn.execute(
-                    "SELECT id, status FROM leads WHERE business_name = ? COLLATE NOCASE "
+                    "SELECT id, status, contacted_at FROM leads WHERE business_name = ? COLLATE NOCASE "
                     "AND (address IS NULL OR TRIM(address) = '') "
                     "AND (phone IS NULL OR TRIM(phone) = '')",
                     (name,),
@@ -403,21 +431,36 @@ def save_leads(df: pd.DataFrame) -> dict:
             has_facebook = str(row.get("Has facebook", "")).strip().lower() == "true"
             move_to_cold_call = str(row.get("Move to Cold Call", "")).strip().lower() == "true"
 
+            new_status_value = str(row.get("Call status", "")) or "Not Contacted"
+
             if existing:
                 duplicate_count += 1
+                # Only touch contacted_at when the status ACTUALLY changed.
+                # save_leads() re-upserts every row it is given, so
+                # recomputing for unchanged rows would stamp "now" onto
+                # every old already-contacted lead (contacted_at NULL)
+                # on the first save after this migration.
+                existing_keys = existing.keys()
+                existing_status = (existing["status"] if "status" in existing_keys else None) or "Not Contacted"
+                existing_contacted_at = existing["contacted_at"] if "contacted_at" in existing_keys else None
+                if new_status_value != existing_status:
+                    new_contacted_at = _next_contacted_at(existing_contacted_at, new_status_value, now)
+                else:
+                    new_contacted_at = existing_contacted_at
                 conn.execute(
                     """
                     UPDATE leads SET
                         niche = ?, phone = ?, status = ?, call_notes = ?,
                         text_phone_number = ?, email = ?, rating = ?, review_count = ?,
                         has_facebook = ?, facebook_url = ?, move_to_cold_call = ?,
-                        screened = ?, maps_url = ?, search_query = ?, updated_at = ?
+                        screened = ?, maps_url = ?, search_query = ?, contacted_at = ?,
+                        updated_at = ?
                     WHERE id = ?
                     """,
                     (
                         str(row.get("Category", "")) or None,
                         str(row.get("Phone", "")) or None,
-                        str(row.get("Call status", "")) or "Not Contacted",
+                        new_status_value,
                         str(row.get("Call notes", "")) or None,
                         str(row.get("Text Phone Number", "")) or None,
                         str(row.get("Email", "")) or None,
@@ -429,6 +472,7 @@ def save_leads(df: pd.DataFrame) -> dict:
                         str(row.get("Screened", "")) or None,
                         str(row.get("Maps URL", "")) or None,
                         str(row.get("Search query", "")) or None,
+                        new_contacted_at,
                         now,
                         existing["id"],
                     ),
@@ -442,8 +486,8 @@ def save_leads(df: pd.DataFrame) -> dict:
                         has_facebook, facebook_url, status, call_notes,
                         text_phone_number, email, rating, review_count,
                         move_to_cold_call, screened, maps_url, search_query,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        contacted_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         name,
@@ -453,7 +497,7 @@ def save_leads(df: pd.DataFrame) -> dict:
                         "yes" if has_website else None,  # non-null = "has a website"
                         1 if has_facebook else 0,
                         str(row.get("Facebook URL", "")) or None,
-                        str(row.get("Call status", "")) or "Not Contacted",
+                        new_status_value,
                         str(row.get("Call notes", "")) or None,
                         str(row.get("Text Phone Number", "")) or None,
                         str(row.get("Email", "")) or None,
@@ -463,6 +507,7 @@ def save_leads(df: pd.DataFrame) -> dict:
                         str(row.get("Screened", "")) or None,
                         str(row.get("Maps URL", "")) or None,
                         str(row.get("Search query", "")) or None,
+                        _next_contacted_at(None, new_status_value, now),
                         now,
                         now,
                     ),

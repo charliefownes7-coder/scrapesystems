@@ -33,7 +33,7 @@ from pydantic import BaseModel
 
 from db_store import (
     DB_PATH, REQUIRED_COLUMNS, load_leads, save_leads, _ensure_schema,
-    log_scrape_history, get_scrape_history,
+    log_scrape_history, get_scrape_history, _next_contacted_at,
 )
 from scraper import scrape_maps, check_facebook_pages
 from swipe_launcher import router as swipe_launcher_router
@@ -1305,6 +1305,12 @@ def get_leads():
             # existing yet on a fresh install that hasn't used that
             # feature. "good" | "bad" | None.
             "screened": row["screened"] if "screened" in row.keys() and row["screened"] else None,
+            # ISO 8601 UTC timestamp, set once when a lead's status first
+            # becomes anything other than "Not Contacted" (see db_store's
+            # _next_contacted_at). None = never contacted, or a lead from
+            # before this column existed. Source of truth for the
+            # dashboard's contacted stats/chart.
+            "contactedAt": row["contacted_at"] if "contacted_at" in row.keys() and row["contacted_at"] else None,
         }
         for row in rows
     ]
@@ -1423,17 +1429,86 @@ def update_lead_status(lead_id: int, body: StatusUpdate):
         raise HTTPException(status_code=401, detail="Not connected — log in on the website first.")
 
     conn = sqlite3.connect(DB_PATH)
-    cur = conn.execute(
-        "UPDATE leads SET status = ?, updated_at = datetime('now') WHERE id = ?",
-        (body.status, lead_id),
-    )
-    conn.commit()
-    updated = cur.rowcount
-    conn.close()
+    conn.row_factory = sqlite3.Row
+    try:
+        existing = conn.execute(
+            "SELECT contacted_at FROM leads WHERE id = ?", (lead_id,)
+        ).fetchone()
+        if existing is None:
+            raise HTTPException(status_code=404, detail=f"No lead with id {lead_id}")
 
-    if updated == 0:
-        raise HTTPException(status_code=404, detail=f"No lead with id {lead_id}")
-    return {"id": lead_id, "callStatus": body.status}
+        now = datetime.now(timezone.utc).isoformat()
+        new_contacted_at = _next_contacted_at(existing["contacted_at"], body.status, now)
+
+        conn.execute(
+            "UPDATE leads SET status = ?, contacted_at = ?, updated_at = datetime('now') WHERE id = ?",
+            (body.status, new_contacted_at, lead_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"id": lead_id, "callStatus": body.status, "contactedAt": new_contacted_at}
+
+
+class ScreenedUpdate(BaseModel):
+    # "good" | "bad" | None (None clears the mark).
+    screened: Optional[str] = None
+
+
+@app.patch("/leads/{lead_id}/screened", dependencies=[Depends(require_dashboard_client)])
+def update_lead_screened(lead_id: int, body: ScreenedUpdate):
+    """
+    Marks a single lead Good or Bad straight from the dashboard table,
+    for any lead (not only ones that went through the Facebook
+    checker / swipe tool). Mirrors the swipe tool's write logic in
+    lead_review.py's _mark_lead():
+
+    - "bad"  -> screened = 'bad' and status = 'Bad Lead'.
+    - "good" -> screened = 'good'; a leftover status of 'Bad Lead' is
+                reset to 'Not Contacted' so a row can never be both.
+    - None / "" -> clears the mark; a status of 'Bad Lead' is reset
+                to 'Not Contacted' the same way.
+
+    contacted_at is never stamped by this endpoint: marking a lead
+    good/bad is a screening decision, not outreach. It is only cleared
+    when the status goes back to 'Not Contacted', same rule as
+    everywhere else (see db_store._next_contacted_at).
+    """
+    if load_token() is None:
+        raise HTTPException(status_code=401, detail="Not connected — log in on the website first.")
+
+    value = (body.screened or "").strip().lower() or None
+    if value not in (None, "good", "bad"):
+        raise HTTPException(status_code=400, detail='screened must be "good", "bad", or null.')
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        existing = conn.execute(
+            "SELECT status, contacted_at FROM leads WHERE id = ?", (lead_id,)
+        ).fetchone()
+        if existing is None:
+            raise HTTPException(status_code=404, detail=f"No lead with id {lead_id}")
+
+        status = existing["status"] or "Not Contacted"
+        contacted_at = existing["contacted_at"]
+
+        if value == "bad":
+            status = "Bad Lead"
+        elif status == "Bad Lead":
+            status = "Not Contacted"
+            contacted_at = _next_contacted_at(contacted_at, status, None)
+
+        conn.execute(
+            "UPDATE leads SET screened = ?, status = ?, contacted_at = ?, updated_at = datetime('now') WHERE id = ?",
+            (value, status, contacted_at, lead_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"id": lead_id, "screened": value, "callStatus": status, "contactedAt": contacted_at}
 
 
 class LeadFieldsUpdate(BaseModel):
