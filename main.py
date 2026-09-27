@@ -1543,5 +1543,14 @@ def update_lead_fields(lead_id: int, body: LeadFieldsUpdate):
 if __name__ == "__main__":
     import uvicorn
 
+    from gen_cert import ensure_cert
+
     free_port(8765)
-    uvicorn.run(app, host="127.0.0.1", port=8765)
+    key_path, cert_path = ensure_cert()
+    uvicorn.run(
+        app,
+        host="127.0.0.1",
+        port=8765,
+        ssl_keyfile=key_path,
+        ssl_certfile=cert_path,
+    )
