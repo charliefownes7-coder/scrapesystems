@@ -123,11 +123,33 @@ def _trust_ca_mac():
 
 
 def _trust_ca_windows():
-    # Triggers one native UAC-style prompt.
+    # -user (rather than -addstore Root without it) writes to the
+    # CURRENT USER's Root store, not the machine-wide one — that's
+    # deliberate: it's what lets this succeed without an elevated/UAC
+    # prompt, since Chrome/Edge/Firefox-via-Windows-store all honor
+    # the per-user Root store. The previous version of this function
+    # never checked whether the command actually succeeded, so a
+    # failure (missing certutil, corrupt cert file, etc.) passed
+    # silently and the user was left with a half-trusted cert and no
+    # explanation — same failure mode as the Linux one-time warning
+    # path, just without the message telling them what to do instead.
     try:
-        subprocess.run(["certutil", "-addstore", "-user", "Root", CA_CERT_PATH], check=False)
+        result = subprocess.run(
+            ["certutil", "-addstore", "-user", "Root", CA_CERT_PATH],
+            capture_output=True, text=True, check=False,
+        )
+        if result.returncode != 0:
+            print(f"  Warning: couldn't add local certificate to the Windows trust store "
+                  f"({result.stderr.strip() or result.stdout.strip()}). The browser will show "
+                  f"a one-time certificate warning instead — click through it to continue.")
+    except FileNotFoundError:
+        print("  Warning: 'certutil' isn't available on this system, so the local certificate "
+              "couldn't be trusted automatically. The browser will show a one-time certificate "
+              "warning instead — click through it to continue.")
     except Exception as e:
-        print(f"  Warning: couldn't add local certificate to Windows trust store automatically ({e})")
+        print(f"  Warning: couldn't add local certificate to Windows trust store automatically "
+              f"({e}). The browser will show a one-time certificate warning instead — click "
+              f"through it to continue.")
 
 
 def _trust_ca_linux():
