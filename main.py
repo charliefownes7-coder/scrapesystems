@@ -80,6 +80,11 @@ def free_port(port: int):
     understand a combined "-tulpn" flag the way Linux does, and calling
     it that way was hanging the whole first run on Windows instead of
     failing fast).
+
+    Iterates processes one at a time (rather than calling psutil's
+    global net_connections()) because on Mac, inspecting a connection
+    for a process we don't own raises psutil.AccessDenied — the global
+    call crashes on the first such process instead of just skipping it.
     """
     try:
         import psutil
@@ -88,13 +93,16 @@ def free_port(port: int):
         # let uvicorn's bind attempt fail with its normal error.
         return
 
-    for conn in psutil.net_connections(kind="inet"):
-        if conn.laddr and conn.laddr.port == port and conn.status == psutil.CONN_LISTEN:
-            if conn.pid:
-                try:
-                    psutil.Process(conn.pid).kill()
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
+    for proc in psutil.process_iter(["pid"]):
+        try:
+            for conn in proc.net_connections(kind="inet"):
+                if conn.laddr and conn.laddr.port == port and conn.status == psutil.CONN_LISTEN:
+                    proc.kill()
+                    break
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            # Can't inspect this process (not ours, already gone, etc.)
+            # — skip it and keep checking the rest.
+            continue
 
 
 def save_token(token: str, email: Optional[str] = None):
