@@ -24,7 +24,7 @@ jobs:
         run: |
           ./venv/bin/python3 main.py &
           sleep 3
-          curl -f http://127.0.0.1:8765/ping
+          curl -kf https://127.0.0.1:8765/ping
 
   test-windows:
     runs-on: windows-latest
@@ -38,4 +38,4 @@ jobs:
         run: |
           Start-Process -NoNewWindow venv\Scripts\python.exe -ArgumentList "main.py"
           Start-Sleep -Seconds 3
-          Invoke-WebRequest http://127.0.0.1:8765/ping -UseBasicParsing
+          Invoke-WebRequest https://127.0.0.1:8765/ping -UseBasicParsing -SkipCertificateCheck
