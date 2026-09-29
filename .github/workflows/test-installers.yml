@@ -110,7 +110,7 @@ jobs:
           $up = $false
           for ($i = 0; $i -lt 40; $i++) {
             try {
-              Invoke-WebRequest -Uri https://127.0.0.1:8765/ping -UseBasicParsing -TimeoutSec 5 | Out-Null
+              Invoke-WebRequest -Uri https://127.0.0.1:8765/ping -UseBasicParsing -SkipCertificateCheck -TimeoutSec 5 | Out-Null
               $up = $true
               Write-Host "Agent is up after $($i * 10)s"
               break
@@ -147,7 +147,7 @@ jobs:
           $up = $false
           for ($i = 0; $i -lt 20; $i++) {
             try {
-              Invoke-WebRequest -Uri https://127.0.0.1:8765/ping -UseBasicParsing -TimeoutSec 5 | Out-Null
+              Invoke-WebRequest -Uri https://127.0.0.1:8765/ping -UseBasicParsing -SkipCertificateCheck -TimeoutSec 5 | Out-Null
               $up = $true
               break
             } catch {
