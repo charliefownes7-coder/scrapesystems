@@ -55,12 +55,12 @@ jobs:
         shell: powershell
         run: |
           [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}
-          $proc = Start-Process -FilePath "venv\Scripts\python.exe" -ArgumentList "-u","ci_trace_run.py" `
+          $proc = Start-Process -FilePath "venv\Scripts\python.exe" -ArgumentList "-u","main.py" `
             -RedirectStandardOutput agent.log `
             -RedirectStandardError agent_err.log `
             -NoNewWindow -PassThru
           $up = $false
-          for ($i = 1; $i -le 20; $i++) {
+          for ($i = 1; $i -le 40; $i++) {
             try {
               Invoke-WebRequest -Uri https://127.0.0.1:8765/ping -UseBasicParsing -TimeoutSec 5 | Out-Null
               $up = $true
