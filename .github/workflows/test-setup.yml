@@ -52,7 +52,7 @@ jobs:
         run: .\setup-windows.bat
         shell: cmd
       - name: Confirm the agent actually starts
-        shell: powershell
+        shell: pwsh
         run: |
           [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}
           $proc = Start-Process -FilePath "venv\Scripts\python.exe" -ArgumentList "-u","main.py" `
@@ -62,7 +62,7 @@ jobs:
           $up = $false
           for ($i = 1; $i -le 40; $i++) {
             try {
-              Invoke-WebRequest -Uri https://127.0.0.1:8765/ping -UseBasicParsing -TimeoutSec 5 | Out-Null
+              Invoke-WebRequest -Uri https://127.0.0.1:8765/ping -UseBasicParsing -TimeoutSec 5 -SkipCertificateCheck | Out-Null
               $up = $true
               Write-Host "Agent is up after $($i * 3)s"
               break
