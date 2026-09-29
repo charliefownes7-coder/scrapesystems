@@ -55,7 +55,7 @@ jobs:
         shell: powershell
         run: |
           [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}
-          $proc = Start-Process -FilePath "venv\Scripts\python.exe" -ArgumentList "main.py" `
+          $proc = Start-Process -FilePath "venv\Scripts\python.exe" -ArgumentList "-u","main.py" `
             -RedirectStandardOutput agent.log `
             -RedirectStandardError agent_err.log `
             -NoNewWindow -PassThru
@@ -76,6 +76,9 @@ jobs:
           }
           if (-not $up) {
             Write-Host "Agent never responded to /ping. Logs:"
+            Write-Host "Process exited: $($proc.HasExited)"
+            netstat -ano | findstr 8765
+            Get-ChildItem -Force | Select-Object Name
             Get-Content agent.log, agent_err.log
             exit 1
           }
