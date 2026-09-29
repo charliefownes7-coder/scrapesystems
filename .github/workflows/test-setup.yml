@@ -55,7 +55,7 @@ jobs:
         shell: powershell
         run: |
           [System.Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}
-          $proc = Start-Process -FilePath "venv\Scripts\python.exe" -ArgumentList "-u","main.py" `
+          $proc = Start-Process -FilePath "venv\Scripts\python.exe" -ArgumentList "-u","ci_trace_run.py" `
             -RedirectStandardOutput agent.log `
             -RedirectStandardError agent_err.log `
             -NoNewWindow -PassThru
