@@ -15,7 +15,6 @@ import itertools
 import json
 import queue
 import sqlite3
-import subprocess
 import threading
 import time
 import uuid
@@ -75,28 +74,27 @@ def free_port(port: int):
     Kill any process already listening on this port before we try to
     bind — prevents the '[Errno 98] address already in use' crash that
     happens when a previous run's process didn't get cleaned up.
+
+    Cross-platform via psutil (no shelling out to fuser/netstat, whose
+    flags differ between Mac/Linux and Windows — Windows netstat doesn't
+    understand a combined "-tulpn" flag the way Linux does, and calling
+    it that way was hanging the whole first run on Windows instead of
+    failing fast).
     """
     try:
-        subprocess.run(
-            ["fuser", "-k", f"{port}/tcp"],
-            capture_output=True, text=True,
-        )
+        import psutil
+    except ImportError:
+        # psutil isn't installed — best-effort only, same as before:
+        # let uvicorn's bind attempt fail with its normal error.
         return
-    except FileNotFoundError:
-        pass
 
-    # fuser not available — fall back to a netstat-based lookup.
-    try:
-        out = subprocess.check_output(["netstat", "-tulpn"], text=True)
-        for line in out.splitlines():
-            if f":{port} " in line and "LISTEN" in line:
-                pid = line.split()[-1].split("/")[0]
-                if pid.isdigit():
-                    subprocess.run(["kill", "-9", pid])
-    except Exception:
-        # Best-effort only — if neither tool is available, just let
-        # uvicorn's bind attempt fail with its normal error as before.
-        pass
+    for conn in psutil.net_connections(kind="inet"):
+        if conn.laddr and conn.laddr.port == port and conn.status == psutil.CONN_LISTEN:
+            if conn.pid:
+                try:
+                    psutil.Process(conn.pid).kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
 
 
 def save_token(token: str, email: Optional[str] = None):
