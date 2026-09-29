@@ -136,12 +136,15 @@ def _trust_ca_windows():
     try:
         result = subprocess.run(
             ["certutil", "-addstore", "-user", "Root", CA_CERT_PATH],
-            capture_output=True, text=True, check=False,
+            capture_output=True, text=True, check=False, timeout=30,
         )
         if result.returncode != 0:
             print(f"  Warning: couldn't add local certificate to the Windows trust store "
                   f"({result.stderr.strip() or result.stdout.strip()}). The browser will show "
                   f"a one-time certificate warning instead — click through it to continue.")
+    except subprocess.TimeoutExpired:
+        print("  Warning: Windows did not finish adding the local certificate in time. "
+              "The browser will show a one-time certificate warning instead - click through it to continue.")
     except FileNotFoundError:
         print("  Warning: 'certutil' isn't available on this system, so the local certificate "
               "couldn't be trusted automatically. The browser will show a one-time certificate "
