@@ -31,15 +31,45 @@ echo Python isn't installed on this PC -- installing it now.
 echo ^(This downloads about 25 MB and needs an internet connection.^)
 echo.
 set "PY_INSTALLER=%TEMP%\scrapesystems-python-installer.exe"
+set "PY_LOG=%TEMP%\scrapesystems-python-install.log"
+set "PYCHECK=%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
 if exist "%PY_INSTALLER%" del "%PY_INSTALLER%" >nul 2>nul
 powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; try { Invoke-WebRequest -UseBasicParsing -Uri 'https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe' -OutFile (Join-Path $env:TEMP 'scrapesystems-python-installer.exe') } catch { exit 1 }"
 if errorlevel 1 goto :python_failed
 if not exist "%PY_INSTALLER%" goto :python_failed
 echo Running the Python installer ^(this takes a minute^)...
-start /wait "" "%PY_INSTALLER%" /quiet InstallAllUsers=0 PrependPath=1 Include_launcher=0 Include_test=0 Include_doc=0 Shortcuts=0
-if not exist "%LOCALAPPDATA%\Programs\Python\Python312\python.exe" goto :python_failed
-set PYEXE="%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
+start /wait "" "%PY_INSTALLER%" /quiet /log "%PY_LOG%" InstallAllUsers=0 PrependPath=1 Include_launcher=0 Shortcuts=0
+
+REM The installer can hand its work to a child process, so "start /wait"
+REM may return early. Wait until no installer process is left running.
+set /a TRIES=0
+:wait_installer_exit
+tasklist /FI "IMAGENAME eq scrapesystems-python-installer.exe" 2>nul | find /I "scrapesystems-python-installer.exe" >nul
+if errorlevel 1 goto :installer_exited
+set /a TRIES+=1
+if %TRIES% geq 60 goto :installer_exited
+ping -n 4 127.0.0.1 >nul
+goto :wait_installer_exit
+:installer_exited
+
+if not exist "%PYCHECK%" goto :python_unhealthy
+
+REM Self-test the fresh Python before trusting it: these are the pieces
+REM pip and venv need. Retry for a few minutes in case files are still
+REM being written.
+echo Checking the new Python...
+set /a TRIES=0
+:wait_python_ready
+"%PYCHECK%" -c "import encodings.cp437, zipfile, ssl, venv, ensurepip" >nul 2>nul
+if not errorlevel 1 goto :python_healthy
+set /a TRIES+=1
+if %TRIES% geq 25 goto :python_unhealthy
+ping -n 7 127.0.0.1 >nul
+goto :wait_python_ready
+
+:python_healthy
 del "%PY_INSTALLER%" >nul 2>nul
+set PYEXE="%PYCHECK%"
 
 :have_python
 echo Python found.
@@ -86,6 +116,14 @@ echo.
 echo Starting ScrapeSystems agent...
 venv\Scripts\python.exe main.py
 exit /b %errorlevel%
+
+:python_unhealthy
+echo.
+echo Python installed but did not pass its self-test. Details for support:
+dir "%LOCALAPPDATA%\Programs\Python\Python312\Lib\encodings\cp437.py"
+"%PYCHECK%" -c "import encodings.cp437, zipfile, ssl, venv, ensurepip"
+powershell -NoProfile -Command "Get-ChildItem $env:TEMP -Filter 'scrapesystems-python-install*' | ForEach-Object { Write-Host ('== ' + $_.Name); Get-Content -Tail 15 $_.FullName }"
+goto :python_failed
 
 :python_failed
 echo.

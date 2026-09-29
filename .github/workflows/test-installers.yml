@@ -206,6 +206,10 @@ jobs:
               Write-Host "Agent is up after $($i * 10)s"
               break
             } catch {
+              if ($proc.HasExited) {
+                Write-Host "Launcher exited early with code $($proc.ExitCode)."
+                break
+              }
               Start-Sleep -Seconds 10
             }
           }
@@ -220,6 +224,22 @@ jobs:
             exit 1
           }
           Write-Host "Launcher installed Python itself and started the agent."
+
+      - name: Python install diagnostics
+        if: always()
+        shell: pwsh
+        run: |
+          $py = "$env:LOCALAPPDATA\Programs\Python\Python312"
+          Write-Host "----- Python folder -----"
+          Test-Path "$py\python.exe"
+          Get-ChildItem "$py\Lib\encodings" -Filter "cp437*" -ErrorAction SilentlyContinue | Select-Object Name, Length
+          Write-Host "----- self-test -----"
+          & "$py\python.exe" -c "import encodings.cp437, zipfile, ssl, venv, ensurepip; print('self-test ok')"
+          Write-Host "----- installer logs -----"
+          Get-ChildItem $env:TEMP -Filter "scrapesystems-python-install*" -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "== $($_.Name)"
+            Get-Content -Tail 30 $_.FullName
+          }
 
       - name: Stop agent
         if: always()
