@@ -1000,6 +1000,16 @@ def continue_scrape(job_id: Optional[str] = Query(None)):
                 raise HTTPException(status_code=409, detail="No stopped scrape to continue.")
             job_id = next(reversed(_jobs))
         job = _jobs.get(job_id)
+        if job is not None and job["phase"] not in ("stopped", "done", "error", "ended", "idle"):
+            # Already queued/running, e.g. a second Continue click that
+            # arrived after the first one already resumed it, or a stale
+            # dashboard still showing "Paused". Nothing left to do, so
+            # answer success instead of a confusing 409. The one
+            # exception: a stop/end is still in flight (the job is
+            # about to pause), where saying "resumed" would be wrong.
+            if _stop_events[job_id].is_set() or _end_requested.get(job_id):
+                raise HTTPException(status_code=409, detail="Still pausing — try again in a moment.")
+            return {"job_id": job_id, "status": "resumed", "already": True}
         if job is None or job["phase"] != "stopped":
             raise HTTPException(status_code=409, detail="No stopped scrape to continue.")
         resume = job.get("_resume")
